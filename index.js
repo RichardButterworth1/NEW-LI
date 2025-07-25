@@ -9,15 +9,8 @@ const {
   PHANTOMBUSTER_API_KEY,
   PHANTOMBUSTER_AGENT_ID,
   PORT = 3000,
-
-  // How many ms we allow a *single poll cycle* to run before we give up (per GET /results call)
-  MAX_SINGLE_POLL_WAIT_MS = 25000,
-
-  // How often we poll PB in that single cycle (you can also leave it at 0 to just snapshot once)
-  POLL_EVERY_MS = 3000,
-
-  // To avoid ResponseTooLargeError in GPT connector
-  MAX_RESULTS_RETURNED = 50
+  POLL_EVERY_MS = 5000,   // When *we* poll (GET /results/:batchId) each run
+  MAX_WAIT_MS = 180000    // Safety cap for single poll cycle (not used for POST)
 } = process.env;
 
 if (!PHANTOMBUSTER_API_KEY || !PHANTOMBUSTER_AGENT_ID) {
@@ -37,16 +30,82 @@ const DEFAULT_TITLES = [
   "Product Sustainability Director"
 ];
 
-// ------------------------------------
-// Utilities
-// ------------------------------------
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 function buildLinkedInSearchUrl(title, company) {
   const q = `${title} "${company}"`;
   return `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`;
+}
+
+// ---- In-memory store of batches (good enough for single-user) ----
+/**
+ * batches: {
+ *   [batchId]: {
+ *     company: string,
+ *     titles: string[],
+ *     createdAt: number,
+ *     runs: {
+ *       [title]: {
+ *         title: string,
+ *         url: string,
+ *         containerId: string,
+ *         status: "running" | "finished" | "aborted" | "error",
+ *         resultObject: any | null,
+ *         error: string | null
+ *       }
+ *     }
+ *   }
+ * }
+ */
+const batches = Object.create(null);
+
+/**
+ * Launches one PB run for a single title (returns containerId).
+ * We don't wait here—non-blocking.
+ */
+async function launchRunForTitle(title, company) {
+  const linkedInSearchUrl = buildLinkedInSearchUrl(title, company);
+  const launchUrl = `https://api.phantombuster.com/api/v1/agent/${PHANTOMBUSTER_AGENT_ID}/launch`;
+
+  const launchPayload = {
+    argument: {
+      // IMPORTANT: your Phantom must read this singular field
+      linkedInSearchUrl
+    }
+  };
+
+  const launchRes = await axios.post(launchUrl, launchPayload, { headers });
+  const data = launchRes.data || {};
+  const containerId =
+    data.containerId || data.data?.containerId || data.container?.id;
+
+  if (!containerId) {
+    throw new Error(`No containerId returned by PB for title "${title}"`);
+  }
+
+  return { containerId, url: linkedInSearchUrl };
+}
+
+/**
+ * Polls a single run for its final status and returns final state.
+ * (No fabrication: if resultObject isn't present, we say so.)
+ */
+async function pollSingleRun(containerId) {
+  const outUrl = `https://api.phantombuster.com/api/v1/agent/${PHANTOMBUSTER_AGENT_ID}/output?containerId=${encodeURIComponent(
+    containerId
+  )}`;
+  try {
+    const outRes = await axios.get(outUrl, { headers });
+    const out = outRes.data || {};
+    const status = out.status || out.data?.status;
+    const resultObject = out.resultObject || out.data?.resultObject;
+
+    return { status, resultObject, error: out.error || null };
+  } catch (e) {
+    return {
+      status: "error",
+      resultObject: null,
+      error: e?.response?.data || e.message || "Unknown error"
+    };
+  }
 }
 
 function normalizeToArray(resultObject) {
@@ -67,7 +126,7 @@ function dedupeByUrl(items) {
       it.url ||
       it.linkedinProfileUrl ||
       it.publicProfileUrl ||
-      JSON.stringify(it); // worst-case fallback
+      JSON.stringify(it);
     if (!seen.has(key)) {
       seen.add(key);
       out.push(it);
@@ -76,101 +135,25 @@ function dedupeByUrl(items) {
   return out;
 }
 
-// Trim arrays to avoid huge payloads to GPT connector
-function truncateArray(arr, max) {
-  if (!Array.isArray(arr)) return arr;
-  return arr.slice(0, max);
-}
-
-// ------------------------------------
-// In-memory batches (ok for single-user, ephemeral)
-// ------------------------------------
-/**
- * batches: {
- *   [batchId]: {
- *     company: string,
- *     titles: string[],
- *     createdAt: number,
- *     runs: {
- *       [title]: {
- *         title: string,
- *         url: string,
- *         containerId: string | null,
- *         status: "running" | "finished" | "aborted" | "error",
- *         resultObject: any | null,
- *         error: string | null
- *       }
- *     }
- *   }
- * }
- */
-const batches = Object.create(null);
-
-// ------------------------------------
-// PhantomBuster helpers
-// ------------------------------------
-async function launchRunForTitle(title, company) {
-  const linkedInSearchUrl = buildLinkedInSearchUrl(title, company);
-  const launchUrl = `https://api.phantombuster.com/api/v1/agent/${PHANTOMBUSTER_AGENT_ID}/launch`;
-
-  const launchPayload = {
-    argument: {
-      linkedInSearchUrl
-    }
-  };
-
-  const launchRes = await axios.post(launchUrl, launchPayload, { headers });
-  const data = launchRes.data || {};
-  const containerId =
-    data.containerId || data.data?.containerId || data.container?.id;
-
-  if (!containerId) {
-    throw new Error(`No containerId returned by PB for title "${title}"`);
-  }
-
-  return { containerId, url: linkedInSearchUrl };
-}
-
-async function pollSingleRun(containerId) {
-  const outUrl = `https://api.phantombuster.com/api/v1/agent/${PHANTOMBUSTER_AGENT_ID}/output?containerId=${encodeURIComponent(
-    containerId
-  )}`;
-  try {
-    const outRes = await axios.get(outUrl, { headers });
-    const out = outRes.data || {};
-    const status = out.status || out.data?.status;
-    const resultObject = out.resultObject || out.data?.resultObject;
-    return { status, resultObject, error: out.error || null };
-  } catch (e) {
-    return {
-      status: "error",
-      resultObject: null,
-      error: e?.response?.data || e.message || "Unknown error"
-    };
-  }
-}
-
-// ------------------------------------
-// Routes
-// ------------------------------------
-
 /**
  * POST /search-profiles
- * Body:
- *  {
- *    "company": "Airbus",
- *    "titles": ["Product Regulatory Manager", ...]   // optional
- *  }
+ * Starts the runs. Does NOT wait.
  *
- * Returns immediately:
- *  {
- *    "batchId": "...",
- *    "company": "...",
- *    "titles": [...],
- *    "runs": {
- *      "<title>": { containerId, status, url, error }
- *    }
- *  }
+ * Body:
+ * {
+ *   "company": "Airbus",
+ *   "titles": ["Product Regulatory Manager", ...] // optional
+ * }
+ *
+ * Response:
+ * {
+ *   "batchId": "...",
+ *   "company": "...",
+ *   "titles": [...],
+ *   "runs": {
+ *     "title": { "containerId": "...", "status": "running" }
+ *   }
+ * }
  */
 app.post("/search-profiles", async (req, res) => {
   const company = (req.body.company || "").trim();
@@ -190,6 +173,7 @@ app.post("/search-profiles", async (req, res) => {
     runs: {}
   };
 
+  // Launch in parallel, but we’ll collect containerIds before returning.
   await Promise.all(
     titles.map(async (title) => {
       try {
@@ -202,7 +186,6 @@ app.post("/search-profiles", async (req, res) => {
           resultObject: null,
           error: null
         };
-        console.log(`🚀 Started PB run for "${title}" (containerId=${containerId})`);
       } catch (err) {
         console.error(`❌ Launch failed for "${title}":`, err.message || err);
         batches[batchId].runs[title] = {
@@ -233,8 +216,27 @@ app.post("/search-profiles", async (req, res) => {
 /**
  * GET /results/:batchId
  *
- * Poll each still-running run ONCE (or for up to MAX_SINGLE_POLL_WAIT_MS total)
- * and return merged + per-title results (TRUNCATED to avoid oversized responses).
+ * Polls PhantomBuster for each run status.
+ * Returns merged + perTitle (only real, live data).
+ *
+ * Response:
+ * {
+ *   "batchId": "...",
+ *   "company": "...",
+ *   "titles": [...],
+ *   "allFinished": boolean,
+ *   "mergedCount": number,
+ *   "merged": [...],
+ *   "perTitle": {
+ *     [title]: {
+ *       status: "running" | "finished" | "aborted" | "error",
+ *       containerId: string | null,
+ *       url: string | null,
+ *       resultObject: any | null,
+ *       error: string | null
+ *     }
+ *   }
+ * }
  */
 app.get("/results/:batchId", async (req, res) => {
   const { batchId } = req.params;
@@ -244,44 +246,28 @@ app.get("/results/:batchId", async (req, res) => {
   }
 
   const { runs } = batch;
-  const start = Date.now();
 
-  // Poll until time budget exhausted or no runs left in "running"
-  while (Date.now() - start < Number(MAX_SINGLE_POLL_WAIT_MS)) {
-    let somethingStillRunning = false;
+  // For each running run, poll its status once.
+  await Promise.all(
+    Object.values(runs).map(async (run) => {
+      if (run.status === "running" && run.containerId) {
+        const { status, resultObject, error } = await pollSingleRun(run.containerId);
 
-    await Promise.all(
-      Object.values(runs).map(async (run) => {
-        if (run.status === "running" && run.containerId) {
-          const { status, resultObject, error } = await pollSingleRun(run.containerId);
-
-          if (status === "finished") {
-            run.status = "finished";
-            run.resultObject = resultObject || null;
-          } else if (status === "aborted" || status === "error") {
-            run.status = status === "error" ? "error" : "aborted";
-            run.error = error ? (typeof error === "string" ? error : JSON.stringify(error)) : null;
-          } else {
-            // still running
-            somethingStillRunning = true;
-          }
+        if (status === "finished") {
+          run.status = "finished";
+          run.resultObject = resultObject || null; // never fabricate
+        } else if (status === "aborted" || status === "error") {
+          run.status = status === "error" ? "error" : "aborted";
+          run.error = error ? (typeof error === "string" ? error : JSON.stringify(error)) : null;
+        } else {
+          // still running
+          run.status = "running";
         }
-      })
-    );
+      }
+    })
+  );
 
-    if (!somethingStillRunning) {
-      break;
-    }
-
-    // wait before next poll round (if we still have time left)
-    if (Date.now() - start + Number(POLL_EVERY_MS) < Number(MAX_SINGLE_POLL_WAIT_MS)) {
-      await sleep(Number(POLL_EVERY_MS));
-    } else {
-      break;
-    }
-  }
-
-  // Build merged, but TRUNCATE to avoid GPT connector payload size issues
+  // Merge only finished runs
   const mergedRaw = [];
   for (const run of Object.values(runs)) {
     if (run.status === "finished" && run.resultObject) {
@@ -289,29 +275,6 @@ app.get("/results/:batchId", async (req, res) => {
     }
   }
   const merged = dedupeByUrl(mergedRaw);
-  const truncatedMerged = truncateArray(merged, Number(MAX_RESULTS_RETURNED));
-
-  // Also truncate perTitle result arrays if present
-  const perTitle = Object.fromEntries(
-    Object.entries(runs).map(([t, r]) => {
-      let ro = r.resultObject;
-      if (Array.isArray(ro)) {
-        ro = ro.slice(0, Number(MAX_RESULTS_RETURNED));
-      } else if (ro && Array.isArray(ro?.data)) {
-        ro = { ...ro, data: ro.data.slice(0, Number(MAX_RESULTS_RETURNED)) };
-      }
-      return [
-        t,
-        {
-          status: r.status,
-          containerId: r.containerId,
-          url: r.url,
-          resultObject: ro,
-          error: r.error
-        }
-      ];
-    })
-  );
 
   const allFinished = Object.values(runs).every(
     (r) => r.status === "finished" || r.status === "aborted" || r.status === "error"
@@ -322,14 +285,25 @@ app.get("/results/:batchId", async (req, res) => {
     company: batch.company,
     titles: batch.titles,
     allFinished,
-    mergedCount: truncatedMerged.length,
-    merged: truncatedMerged,
-    perTitle
+    mergedCount: merged.length,
+    merged,
+    perTitle: Object.fromEntries(
+      Object.entries(runs).map(([t, r]) => [
+        t,
+        {
+          status: r.status,
+          containerId: r.containerId,
+          url: r.url,
+          resultObject: r.resultObject,
+          error: r.error
+        }
+      ])
+    )
   });
 });
 
 app.get("/", (_req, res) => {
-  res.send("PhantomBuster LinkedIn fire-and-poll search service is running.");
+  res.send("PhantomBuster LinkedIn multi-title fire-and-poll service is running.");
 });
 
 app.listen(PORT, () => {
