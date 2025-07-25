@@ -22,15 +22,25 @@ const headers = {
   "X-Phantombuster-Key-1": PHANTOMBUSTER_API_KEY
 };
 
+const DEFAULT_TITLES = [
+  "Product Regulatory Manager",
+  "Regulatory Compliance Director",
+  "Product Stewardship Director",
+  "Product Sustainability Director"
+];
+
 function buildLinkedInSearchUrl(title, company) {
   const q = `${title} "${company}"`;
   return `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`;
 }
 
-async function launchAndWaitForResults(linkedInSearchUrl) {
+/**
+ * Launch a PhantomBuster run with ONE linkedInSearchUrl and
+ * poll until we get the final (live) resultObject.
+ */
+async function launchAndWaitForResult(linkedInSearchUrl) {
   const launchUrl = `https://api.phantombuster.com/api/v1/agent/${PHANTOMBUSTER_AGENT_ID}/launch`;
 
-  // We’ll poll manually to guarantee we only return the final live result
   const launchPayload = {
     argument: {
       linkedInSearchUrl
@@ -47,7 +57,6 @@ async function launchAndWaitForResults(linkedInSearchUrl) {
     throw new Error("PhantomBuster launch did not return a containerId.");
   }
 
-  // Poll /output until status === finished
   const startedAt = Date.now();
   while (true) {
     if (Date.now() - startedAt > Number(MAX_WAIT_MS)) {
@@ -65,7 +74,6 @@ async function launchAndWaitForResults(linkedInSearchUrl) {
 
     if (status === "finished") {
       if (!resultObject) {
-        // Don’t fabricate anything — tell the caller the Phantom returned nothing.
         return {
           _warning:
             "PhantomBuster finished but did not return a resultObject. Ensure your Phantom calls buster.setResultObject(...).",
@@ -86,47 +94,51 @@ async function launchAndWaitForResults(linkedInSearchUrl) {
 }
 
 /**
- * Singular title search endpoint.
+ * Try to coerce PhantomBuster's resultObject to an array of rows.
+ * We WON'T fabricate anything; if we can't detect the structure,
+ * we'll just return an empty array for merged outputs (but keep perTitle raw).
+ */
+function normalizeToArray(resultObject) {
+  if (!resultObject) return [];
+  if (Array.isArray(resultObject)) return resultObject;
+
+  // Common shapes to try:
+  if (Array.isArray(resultObject.data)) return resultObject.data;
+  if (Array.isArray(resultObject.results)) return resultObject.results;
+  if (Array.isArray(resultObject.profiles)) return resultObject.profiles;
+
+  return [];
+}
+
+/**
+ * Deduplicate items by known URL-ish keys.
+ */
+function dedupeByUrl(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key =
+      it.profileUrl ||
+      it.url ||
+      it.linkedinProfileUrl ||
+      it.publicProfileUrl ||
+      JSON.stringify(it); // worst-case fallback (won't dedupe well, but we won't fabricate)
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+/**
+ * POST /search-profiles
  * Body:
  *  {
  *    "company": "Airbus",
- *    "title": "Product Regulatory Manager"
+ *    "titles": ["Product Regulatory Manager", "Regulatory Compliance Director"]
  *  }
  */
-app.post("/search-profile", async (req, res) => {
+app.post("/search-profiles", async (req, res) => {
   try {
-    const company = (req.body.company || "").trim();
-    const title = (req.body.title || "").trim();
-
-    if (!company) {
-      return res.status(400).json({ error: "company is required." });
-    }
-    if (!title) {
-      return res.status(400).json({ error: "title is required." });
-    }
-
-    const linkedInSearchUrl = buildLinkedInSearchUrl(title, company);
-    console.log("🔎 Launching Phantom with URL:", linkedInSearchUrl);
-
-    const results = await launchAndWaitForResults(linkedInSearchUrl);
-
-    // Only return what Phantom actually returned
-    return res.json(results);
-  } catch (err) {
-    console.error("❌ Error:", err?.response?.data || err.message || err);
-    return res.status(500).json({
-      error:
-        "Failed to retrieve live results from PhantomBuster. No fabricated data has been returned.",
-      details: err?.response?.data || err.message || "Unknown error"
-    });
-  }
-});
-
-// (Optional) small helper route
-app.get("/", (_req, res) => {
-  res.send("PhantomBuster LinkedIn singular-title search service is running.");
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-});
+    const company = (req.bo
