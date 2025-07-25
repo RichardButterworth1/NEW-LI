@@ -29,6 +29,10 @@ const DEFAULT_TITLES = [
   "Product Sustainability Director"
 ];
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function buildLinkedInSearchUrl(title, company) {
   const q = `${title} "${company}"`;
   return `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(q)}`;
@@ -89,20 +93,18 @@ async function launchAndWaitForResult(linkedInSearchUrl) {
       );
     }
 
-    await new Promise((r) => setTimeout(r, Number(POLL_EVERY_MS)));
+    await sleep(Number(POLL_EVERY_MS));
   }
 }
 
 /**
  * Try to coerce PhantomBuster's resultObject to an array of rows.
- * We WON'T fabricate anything; if we can't detect the structure,
- * we'll just return an empty array for merged outputs (but keep perTitle raw).
+ * No fabrication: if we can't detect the structure, we'll just return [].
  */
 function normalizeToArray(resultObject) {
   if (!resultObject) return [];
   if (Array.isArray(resultObject)) return resultObject;
 
-  // Common shapes to try:
   if (Array.isArray(resultObject.data)) return resultObject.data;
   if (Array.isArray(resultObject.results)) return resultObject.results;
   if (Array.isArray(resultObject.profiles)) return resultObject.profiles;
@@ -111,7 +113,7 @@ function normalizeToArray(resultObject) {
 }
 
 /**
- * Deduplicate items by known URL-ish keys.
+ * Deduplicate items by likely profile URL keys.
  */
 function dedupeByUrl(items) {
   const seen = new Set();
@@ -122,7 +124,7 @@ function dedupeByUrl(items) {
       it.url ||
       it.linkedinProfileUrl ||
       it.publicProfileUrl ||
-      JSON.stringify(it); // worst-case fallback (won't dedupe well, but we won't fabricate)
+      JSON.stringify(it); // fallback
     if (!seen.has(key)) {
       seen.add(key);
       out.push(it);
@@ -141,4 +143,62 @@ function dedupeByUrl(items) {
  */
 app.post("/search-profiles", async (req, res) => {
   try {
-    const company = (req.bo
+    const company = (req.body.company || "").trim();
+    let titles = Array.isArray(req.body.titles) ? req.body.titles : [];
+
+    if (!company) {
+      return res.status(400).json({ error: "Company is required." });
+    }
+    if (!titles.length) {
+      titles = DEFAULT_TITLES;
+    }
+
+    const perTitle = {};
+    const mergedRaw = [];
+
+    for (const title of titles) {
+      const url = buildLinkedInSearchUrl(title, company);
+      console.log(`🔎 Launching Phantom for "${title}" with URL:`, url);
+
+      try {
+        const resultObject = await launchAndWaitForResult(url);
+        perTitle[title] = resultObject;
+
+        const asArray = normalizeToArray(resultObject);
+        mergedRaw.push(...asArray);
+      } catch (e) {
+        console.error(`❌ Error for title "${title}":`, e?.response?.data || e.message || e);
+        perTitle[title] = {
+          error:
+            "Failed to retrieve live results from PhantomBuster for this title. No fabricated data has been returned.",
+          details: e?.response?.data || e.message || "Unknown error"
+        };
+      }
+    }
+
+    const merged = dedupeByUrl(mergedRaw);
+
+    return res.json({
+      company,
+      titles,
+      mergedCount: merged.length,
+      merged,
+      perTitle
+    });
+  } catch (err) {
+    console.error("❌ Error:", err?.response?.data || err.message || err);
+    return res.status(500).json({
+      error:
+        "Failed to retrieve live results from PhantomBuster. No fabricated data has been returned.",
+      details: err?.response?.data || err.message || "Unknown error"
+    });
+  }
+});
+
+app.get("/", (_req, res) => {
+  res.send("PhantomBuster LinkedIn multi-title search service is running.");
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Server listening on port ${PORT}`);
+});
